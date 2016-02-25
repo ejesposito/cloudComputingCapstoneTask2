@@ -114,6 +114,9 @@ public final class TopTitles {
     }
     JavaPairReceiverInputDStream<String, String> messages = KafkaUtils.createStream(jssc, args[0], args[1], topicMap);
 
+    // Date formater
+    SimpleDateFormat formatter = new SimpleDateFormat("yyyy-MM-dd");
+
     // Get lines from the input stream
     JavaDStream<String> lines = messages.map(new Function<Tuple2<String, String>, String>() {
       public String call(Tuple2<String, String> tuple2) {
@@ -121,64 +124,33 @@ public final class TopTitles {
       }
     });
 
-    // Count the number of on time arrival fligths from X to Y
+    // <"date,Y,X"> and <"date-2,Y,Z">
     JavaDStream<String> words = lines.flatMap(new FlatMapFunction<String, String>() {
       public Iterable<String> call(String x) {
         String[] data = pattern.split(x);
-        if (data.length == 5) {
-          if (data[4].matches("[-+]?\\d*\\.?\\d+")) {
-            if (Double.compare(Double.parseDouble(data[4]), Double.parseDouble("15.00")) < 0) {
-              return Arrays.asList(data[1] + "," + data[2] + "," + data[0]);
-            } else {
-    	      return Arrays.asList();
-            }
-          } else {
-            return Arrays.asList();
-          }
-        } else {
-          return Arrays.asList();
+        if (data.length == 7) {
+          Date date = formatter.parse(data[0]);
+          Calendar cal = Calendar.getInstance();
+          cal.setTime(date);
+          cal.add(Calendar.DATE, -2);
+          Date dateBefore2Days = cal.getTime()
+          return Arrays.asList(formatter.format(date) + "," + data[3] + "," + data[2], formatter.format(dateBefore2Days) + "," + data[2] + "," + data[3]);
         }
       }
     });
 
-    // mapToPair <"Ori,Des,Carrier", 1> -> reduceByKey <"Ori,Des,Carrier", partial sum> -> updateStateByKey <"Ori,Des,Carrier", sum>
-    JavaPairDStream<String, Integer> wordCounts = words.mapToPair(
-      new PairFunction<String, String, Integer>() {
-        public Tuple2<String, Integer> call(String s) {
-          return new Tuple2<String, Integer>(s, 1);
+    // <"date,Y","X"> or <"date,Y","Z">
+    JavaPairDStream<String, String> wordCounts = words.mapToPair(
+      new PairFunction<String, String, String>() {
+        public Tuple2<String, String> call(String s) {
+	  String data[] = pattern.split(s);
+          return new Tuple2<String, String>(data[0] + "," + data[1], data[2]);
         }
-      }).reduceByKey(new Function2<Integer, Integer, Integer>() {
-        public Integer call(Integer i1, Integer i2) {
-          return i1 + i2;
-        }
-      }).updateStateByKey(new Function2<List<Integer>, Optional<Integer>, Optional<Integer>>() {
-        public Optional<Integer> call(List<Integer> values, Optional<Integer> state) {
-          int newSum = state.or(0);
-          for (int i : values) {
-            newSum += i;
-          }
-          return Optional.of(newSum);
-        }
-      });
 
-    // <"Ori,Des,Carrier", sum> transform to <"Ori,Des", "Carrier,sum">
-    JavaPairDStream<String, String> carriersPerAirport = wordCounts.mapToPair(
-      new PairFunction<Tuple2<String, Integer>, String, String>() {
-        public Tuple2<String, String> call(Tuple2<String, Integer> tuple) throws Exception {
-          try {
-            String data[] = pattern.split(tuple._1());
-            String value = String.valueOf(tuple._2());
-            return new Tuple2<String, String>(data[0] + "," + data[1], data[2] + "," + value);
-          } catch (Exception e) {
-            return new Tuple2<String, String>("null", "null,0");
-          }
-        }
-      });
+    // Group by key List<"date,Y","X"> and List<"date,Y","Z">
+    JavaPairDStream<Iterable<String>> grouped = words.groupByKey();
 
-    // Group by key "Ori,Des"
-    JavaPairDStream<String, Iterable<String>> grouped = carriersPerAirport.groupByKey();
-
-    // Sort by "Carrier"
+    // <"date,X,Y,Z",List<"flight","delay">>
     JavaPairDStream<String, Iterable<String>> sorted = grouped.mapValues(
         new Function<Iterable<String>, Iterable<String>>() {
           public Iterable<String> call(Iterable<String> it) {
@@ -200,47 +172,18 @@ public final class TopTitles {
           }
       });
 
-      sorted.foreachRDD(
-        new Function<JavaPairRDD<String,Iterable<String>>, Void>() {
-          public Void call(JavaPairRDD<String, Iterable<String>> rdd) {
-            rdd.foreachPartition(
-              new VoidFunction<Iterator<Tuple2<String,Iterable<String>>>>() {
-                public void call(Iterator<Tuple2<String,Iterable<String>>> it) {
-                  //AmazonDynamoDBClient client = new AmazonDynamoDBClient(new ProfileCredentialsProvider());
-                  try {
-                    List<TopCarriersByAirport> list = new ArrayList<>();
-                    DynamoDBMapper mapper = new DynamoDBMapper(client);
-                    while(it.hasNext()) {
-                      Tuple2<String,Iterable<String>> item = it.next();
-                      TopCarriersByAirport top = new TopCarriersByAirport ();
-                      top.airport = item._1().toString();
-                      top.carriersList = new ArrayList<String> ();
-                      for (String i : (Iterable<String>)item._2()) {
-                        top.carriersList.add(i);
-                      }
-                      list.add(top);
-                    }
-                    mapper.batchSave(list);
-                 } catch (Exception e) {
-                 }
-               }
-             });
-            return null;
-          }
-        });
-
     sorted.print();
     jssc.start();
     jssc.awaitTermination();
   }
 
-   @DynamoDBTable(tableName="TopOriDesByCarrier")
+   @DynamoDBTable(tableName="BestFlights")
    public static class TopCarriersByAirport {
             private String airport;
             private List<String> carriersList;
 
             //Partition key
-            @DynamoDBHashKey(attributeName="Airport")
+            @DynamoDBHashKey(attributeName="Id")
             public String getAirport() { return airport; }
             public void setAirport(String airport) { this.airport = airport; }
 
